@@ -87,6 +87,8 @@ struct ExecutionContext {
     pub debug_native: bool,
     /// Whether to write native plans with metrics to stdout
     pub explain_native: bool,
+    /// Map of metrics name -> jstring object to cache jni_NewStringUTF calls.
+    pub metrics_jstrings: HashMap<String, Arc<GlobalRef>>,
 }
 
 /// Accept serialized query plan and return the address of the native query plan.
@@ -178,6 +180,7 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_createPlan(
             session_ctx: Arc::new(session),
             debug_native,
             explain_native,
+            metrics_jstrings: HashMap::new(),
         });
 
         Ok(Box::into_raw(exec_context) as i64)
@@ -241,7 +244,7 @@ fn prepare_datafusion_session_context(
         session_config = session_config.set_str(key, value);
     }
 
-    let runtime = RuntimeEnv::new(rt_config).unwrap();
+    let runtime = RuntimeEnv::try_new(rt_config).unwrap();
 
     let mut session_ctx = SessionContext::new_with_config_rt(session_config, Arc::new(runtime));
 
@@ -259,21 +262,23 @@ fn parse_bool(conf: &HashMap<String, String>, name: &str) -> CometResult<bool> {
 }
 
 /// Prepares arrow arrays for output.
-unsafe fn prepare_output(
+fn prepare_output(
     env: &mut JNIEnv,
     array_addrs: jlongArray,
     schema_addrs: jlongArray,
     output_batch: RecordBatch,
     exec_context: &mut ExecutionContext,
 ) -> CometResult<jlong> {
-    let array_address_array = JLongArray::from_raw(array_addrs);
+    let array_address_array = unsafe { JLongArray::from_raw(array_addrs) };
     let num_cols = env.get_array_length(&array_address_array)? as usize;
 
-    let array_addrs = env.get_array_elements(&array_address_array, ReleaseMode::NoCopyBack)?;
+    let array_addrs =
+        unsafe { env.get_array_elements(&array_address_array, ReleaseMode::NoCopyBack)? };
     let array_addrs = &*array_addrs;
 
-    let schema_address_array = JLongArray::from_raw(schema_addrs);
-    let schema_addrs = env.get_array_elements(&schema_address_array, ReleaseMode::NoCopyBack)?;
+    let schema_address_array = unsafe { JLongArray::from_raw(schema_addrs) };
+    let schema_addrs =
+        unsafe { env.get_array_elements(&schema_address_array, ReleaseMode::NoCopyBack)? };
     let schema_addrs = &*schema_addrs;
 
     let results = output_batch.columns();
@@ -439,10 +444,11 @@ pub extern "system" fn Java_org_apache_comet_Native_releasePlan(
 }
 
 /// Updates the metrics of the query plan.
-fn update_metrics(env: &mut JNIEnv, exec_context: &ExecutionContext) -> CometResult<()> {
+fn update_metrics(env: &mut JNIEnv, exec_context: &mut ExecutionContext) -> CometResult<()> {
     let native_query = exec_context.root_op.as_ref().unwrap();
     let metrics = exec_context.metrics.as_obj();
-    update_comet_metric(env, metrics, native_query)
+    let metrics_jstrings = &mut exec_context.metrics_jstrings;
+    update_comet_metric(env, metrics, native_query, metrics_jstrings)
 }
 
 fn convert_datatype_arrays(

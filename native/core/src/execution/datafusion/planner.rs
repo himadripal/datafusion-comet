@@ -28,6 +28,7 @@ use crate::{
                 avg::Avg,
                 avg_decimal::AvgDecimal,
                 bitwise_not::BitwiseNotExpr,
+                bloom_filter_agg::BloomFilterAgg,
                 bloom_filter_might_contain::BloomFilterMightContain,
                 checkoverflow::CheckOverflow,
                 correlation::Correlation,
@@ -81,6 +82,7 @@ use datafusion::{
     },
     prelude::SessionContext,
 };
+use datafusion_functions_nested::concat::ArrayAppend;
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 
 use datafusion_comet_proto::{
@@ -96,8 +98,8 @@ use datafusion_comet_proto::{
     spark_partitioning::{partitioning::PartitioningStruct, Partitioning as SparkPartitioning},
 };
 use datafusion_comet_spark_expr::{
-    Cast, CreateNamedStruct, DateTruncExpr, GetStructField, HourExpr, IfExpr, ListExtract,
-    MinuteExpr, RLike, SecondExpr, TimestampTruncExpr, ToJson,
+    Cast, CreateNamedStruct, DateTruncExpr, GetArrayStructFields, GetStructField, HourExpr, IfExpr,
+    ListExtract, MinuteExpr, RLike, SecondExpr, TimestampTruncExpr, ToJson,
 };
 use datafusion_common::scalar::ScalarStructBuilder;
 use datafusion_common::{
@@ -106,10 +108,12 @@ use datafusion_common::{
 };
 use datafusion_expr::expr::find_df_window_func;
 use datafusion_expr::{
-    AggregateUDF, WindowFrame, WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition,
+    AggregateUDF, ScalarUDF, WindowFrame, WindowFrameBound, WindowFrameUnits,
+    WindowFunctionDefinition,
 };
 use datafusion_physical_expr::expressions::{Literal, StatsType};
 use datafusion_physical_expr::window::WindowExpr;
+use datafusion_physical_expr::LexOrdering;
 use itertools::Itertools;
 use jni::objects::GlobalRef;
 use num::{BigInt, ToPrimitive};
@@ -118,7 +122,7 @@ use std::{collections::HashMap, sync::Arc};
 
 // For clippy error on type_complexity.
 type ExecResult<T> = Result<T, ExecutionError>;
-type PhyAggResult = Result<Vec<Arc<AggregateFunctionExpr>>, ExecutionError>;
+type PhyAggResult = Result<Vec<AggregateFunctionExpr>, ExecutionError>;
 type PhyExprResult = Result<Vec<(Arc<dyn PhysicalExpr>, String)>, ExecutionError>;
 type PartitionPhyExprResult = Result<Vec<Arc<dyn PhysicalExpr>>, ExecutionError>;
 
@@ -680,6 +684,42 @@ impl PhysicalPlanner {
                     expr.fail_on_error,
                 )))
             }
+            ExprStruct::GetArrayStructFields(expr) => {
+                let child =
+                    self.create_expr(expr.child.as_ref().unwrap(), Arc::clone(&input_schema))?;
+
+                Ok(Arc::new(GetArrayStructFields::new(
+                    child,
+                    expr.ordinal as usize,
+                )))
+            }
+            ExprStruct::ArrayAppend(expr) => {
+                let left =
+                    self.create_expr(expr.left.as_ref().unwrap(), Arc::clone(&input_schema))?;
+                let right =
+                    self.create_expr(expr.right.as_ref().unwrap(), Arc::clone(&input_schema))?;
+                let return_type = left.data_type(&input_schema)?;
+                let args = vec![Arc::clone(&left), right];
+                let datafusion_array_append =
+                    Arc::new(ScalarUDF::new_from_impl(ArrayAppend::new()));
+                let array_append_expr: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+                    "array_append",
+                    datafusion_array_append,
+                    args,
+                    return_type,
+                ));
+
+                let is_null_expr: Arc<dyn PhysicalExpr> = Arc::new(IsNullExpr::new(left));
+                let null_literal_expr: Arc<dyn PhysicalExpr> =
+                    Arc::new(Literal::new(ScalarValue::Null));
+
+                let case_expr = CaseExpr::try_new(
+                    None,
+                    vec![(is_null_expr, null_literal_expr)],
+                    Some(array_append_expr),
+                )?;
+                Ok(Arc::new(case_expr))
+            }
             expr => Err(ExecutionError::GeneralError(format!(
                 "Not implemented: {:?}",
                 expr
@@ -863,11 +903,12 @@ impl PhysicalPlanner {
                     .collect();
 
                 let num_agg = agg.agg_exprs.len();
+                let aggr_expr = agg_exprs?.into_iter().map(Arc::new).collect();
                 let aggregate = Arc::new(
                     datafusion::physical_plan::aggregates::AggregateExec::try_new(
                         mode,
                         group_by,
-                        agg_exprs?,
+                        aggr_expr,
                         vec![None; num_agg], // no filter expressions
                         Arc::clone(&child),
                         Arc::clone(&schema),
@@ -917,15 +958,15 @@ impl PhysicalPlanner {
 
                 let fetch = sort.fetch.map(|num| num as usize);
 
-                let copy_exec = if can_reuse_input_batch(&child) {
-                    Arc::new(CopyExec::new(child, CopyMode::UnpackOrDeepCopy))
-                } else {
-                    Arc::new(CopyExec::new(child, CopyMode::UnpackOrClone))
-                };
+                // SortExec caches batches so we need to make a copy of incoming batches. Also,
+                // SortExec fails in some cases if we do not unpack dictionary-encoded arrays, and
+                // it would be more efficient if we could avoid that.
+                // https://github.com/apache/datafusion-comet/issues/963
+                let child = Self::wrap_in_copy_exec(child);
 
                 Ok((
                     scans,
-                    Arc::new(SortExec::new(exprs?, copy_exec).with_fetch(fetch)),
+                    Arc::new(SortExec::new(LexOrdering::new(exprs?), child).with_fetch(fetch)),
                 ))
             }
             OpStruct::Scan(scan) => {
@@ -1069,9 +1110,17 @@ impl PhysicalPlanner {
                     join.join_type,
                     &join.condition,
                 )?;
+
+                // HashJoinExec may cache the input batch internally. We need
+                // to copy the input batch to avoid the data corruption from reusing the input
+                // batch. We also need to unpack dictionary arrays, because the join operators
+                // do not support them.
+                let left = Self::wrap_in_copy_exec(join_params.left);
+                let right = Self::wrap_in_copy_exec(join_params.right);
+
                 let hash_join = Arc::new(HashJoinExec::try_new(
-                    join_params.left,
-                    join_params.right,
+                    left,
+                    right,
                     join_params.join_on,
                     join_params.join_filter,
                     &join_params.join_type,
@@ -1135,6 +1184,7 @@ impl PhysicalPlanner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn parse_join_parameters(
         &self,
         inputs: &mut Vec<Arc<GlobalRef>>,
@@ -1263,21 +1313,6 @@ impl PhysicalPlanner {
             None
         };
 
-        // DataFusion Join operators keep the input batch internally. We need
-        // to copy the input batch to avoid the data corruption from reusing the input
-        // batch.
-        let left = if can_reuse_input_batch(&left) {
-            Arc::new(CopyExec::new(left, CopyMode::UnpackOrDeepCopy))
-        } else {
-            Arc::new(CopyExec::new(left, CopyMode::UnpackOrClone))
-        };
-
-        let right = if can_reuse_input_batch(&right) {
-            Arc::new(CopyExec::new(right, CopyMode::UnpackOrDeepCopy))
-        } else {
-            Arc::new(CopyExec::new(right, CopyMode::UnpackOrClone))
-        };
-
         Ok((
             JoinParameters {
                 left,
@@ -1290,12 +1325,22 @@ impl PhysicalPlanner {
         ))
     }
 
+    /// Wrap an ExecutionPlan in a CopyExec, which will unpack any dictionary-encoded arrays
+    /// and make a deep copy of other arrays if the plan re-uses batches.
+    fn wrap_in_copy_exec(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        if can_reuse_input_batch(&plan) {
+            Arc::new(CopyExec::new(plan, CopyMode::UnpackOrDeepCopy))
+        } else {
+            Arc::new(CopyExec::new(plan, CopyMode::UnpackOrClone))
+        }
+    }
+
     /// Create a DataFusion physical aggregate expression from Spark physical aggregate expression
     fn create_agg_expr(
         &self,
         spark_expr: &AggExpr,
         schema: SchemaRef,
-    ) -> Result<Arc<AggregateFunctionExpr>, ExecutionError> {
+    ) -> Result<AggregateFunctionExpr, ExecutionError> {
         match spark_expr.expr_struct.as_ref().unwrap() {
             AggExprStruct::Count(expr) => {
                 assert!(!expr.children.is_empty());
@@ -1365,56 +1410,42 @@ impl PhysicalPlanner {
                 let child = self.create_expr(expr.child.as_ref().unwrap(), Arc::clone(&schema))?;
                 let datatype = to_arrow_datatype(expr.datatype.as_ref().unwrap());
 
-                match datatype {
+                let builder = match datatype {
                     DataType::Decimal128(_, _) => {
-                        let func = AggregateUDF::new_from_impl(SumDecimal::new(
-                            "sum",
+                        let func = AggregateUDF::new_from_impl(SumDecimal::try_new(
                             Arc::clone(&child),
                             datatype,
-                        ));
+                        )?);
                         AggregateExprBuilder::new(Arc::new(func), vec![child])
-                            .schema(schema)
-                            .alias("sum")
-                            .with_ignore_nulls(false)
-                            .with_distinct(false)
-                            .build()
-                            .map_err(|e| ExecutionError::DataFusionError(e.to_string()))
                     }
                     _ => {
                         // cast to the result data type of SUM if necessary, we should not expect
                         // a cast failure since it should have already been checked at Spark side
                         let child =
                             Arc::new(CastExpr::new(Arc::clone(&child), datatype.clone(), None));
-
                         AggregateExprBuilder::new(sum_udaf(), vec![child])
-                            .schema(schema)
-                            .alias("sum")
-                            .with_ignore_nulls(false)
-                            .with_distinct(false)
-                            .build()
-                            .map_err(|e| ExecutionError::DataFusionError(e.to_string()))
                     }
-                }
+                };
+                builder
+                    .schema(schema)
+                    .alias("sum")
+                    .with_ignore_nulls(false)
+                    .with_distinct(false)
+                    .build()
+                    .map_err(|e| e.into())
             }
             AggExprStruct::Avg(expr) => {
                 let child = self.create_expr(expr.child.as_ref().unwrap(), Arc::clone(&schema))?;
                 let datatype = to_arrow_datatype(expr.datatype.as_ref().unwrap());
                 let input_datatype = to_arrow_datatype(expr.sum_datatype.as_ref().unwrap());
-                match datatype {
+                let builder = match datatype {
                     DataType::Decimal128(_, _) => {
                         let func = AggregateUDF::new_from_impl(AvgDecimal::new(
                             Arc::clone(&child),
-                            "avg",
                             datatype,
                             input_datatype,
                         ));
                         AggregateExprBuilder::new(Arc::new(func), vec![child])
-                            .schema(schema)
-                            .alias("avg")
-                            .with_ignore_nulls(false)
-                            .with_distinct(false)
-                            .build()
-                            .map_err(|e| ExecutionError::DataFusionError(e.to_string()))
                     }
                     _ => {
                         // cast to the result data type of AVG if the result data type is different
@@ -1428,14 +1459,15 @@ impl PhysicalPlanner {
                             datatype,
                         ));
                         AggregateExprBuilder::new(Arc::new(func), vec![child])
-                            .schema(schema)
-                            .alias("avg")
-                            .with_ignore_nulls(false)
-                            .with_distinct(false)
-                            .build()
-                            .map_err(|e| ExecutionError::DataFusionError(e.to_string()))
                     }
-                }
+                };
+                builder
+                    .schema(schema)
+                    .alias("avg")
+                    .with_ignore_nulls(false)
+                    .with_distinct(false)
+                    .build()
+                    .map_err(|e| e.into())
             }
             AggExprStruct::First(expr) => {
                 let child = self.create_expr(expr.child.as_ref().unwrap(), Arc::clone(&schema))?;
@@ -1620,6 +1652,22 @@ impl PhysicalPlanner {
                 ));
                 Self::create_aggr_func_expr("correlation", schema, vec![child1, child2], func)
             }
+            AggExprStruct::BloomFilterAgg(expr) => {
+                let child = self.create_expr(expr.child.as_ref().unwrap(), Arc::clone(&schema))?;
+                let num_items =
+                    self.create_expr(expr.num_items.as_ref().unwrap(), Arc::clone(&schema))?;
+                let num_bits =
+                    self.create_expr(expr.num_bits.as_ref().unwrap(), Arc::clone(&schema))?;
+                let datatype = to_arrow_datatype(expr.datatype.as_ref().unwrap());
+                let func = AggregateUDF::new_from_impl(BloomFilterAgg::new(
+                    Arc::clone(&child),
+                    Arc::clone(&num_items),
+                    Arc::clone(&num_bits),
+                    "bloom_filter_agg",
+                    datatype,
+                ));
+                Self::create_aggr_func_expr("bloom_filter_agg", schema, vec![child], func)
+            }
         }
     }
 
@@ -1692,16 +1740,46 @@ impl PhysicalPlanner {
             .and_then(|inner| inner.lower_frame_bound_struct.as_ref())
         {
             Some(l) => match l {
-                LowerFrameBoundStruct::UnboundedPreceding(_) => {
-                    WindowFrameBound::Preceding(ScalarValue::UInt64(None))
-                }
+                LowerFrameBoundStruct::UnboundedPreceding(_) => match units {
+                    WindowFrameUnits::Rows => {
+                        WindowFrameBound::Preceding(ScalarValue::UInt64(None))
+                    }
+                    WindowFrameUnits::Range => {
+                        WindowFrameBound::Preceding(ScalarValue::Int64(None))
+                    }
+                    WindowFrameUnits::Groups => {
+                        return Err(ExecutionError::GeneralError(
+                            "WindowFrameUnits::Groups is not supported.".to_string(),
+                        ));
+                    }
+                },
                 LowerFrameBoundStruct::Preceding(offset) => {
-                    let offset_value = offset.offset.unsigned_abs() as u64;
-                    WindowFrameBound::Preceding(ScalarValue::UInt64(Some(offset_value)))
+                    let offset_value = offset.offset.abs();
+                    match units {
+                        WindowFrameUnits::Rows => WindowFrameBound::Preceding(ScalarValue::UInt64(
+                            Some(offset_value as u64),
+                        )),
+                        WindowFrameUnits::Range => {
+                            WindowFrameBound::Preceding(ScalarValue::Int64(Some(offset_value)))
+                        }
+                        WindowFrameUnits::Groups => {
+                            return Err(ExecutionError::GeneralError(
+                                "WindowFrameUnits::Groups is not supported.".to_string(),
+                            ));
+                        }
+                    }
                 }
                 LowerFrameBoundStruct::CurrentRow(_) => WindowFrameBound::CurrentRow,
             },
-            None => WindowFrameBound::Preceding(ScalarValue::UInt64(None)),
+            None => match units {
+                WindowFrameUnits::Rows => WindowFrameBound::Preceding(ScalarValue::UInt64(None)),
+                WindowFrameUnits::Range => WindowFrameBound::Preceding(ScalarValue::Int64(None)),
+                WindowFrameUnits::Groups => {
+                    return Err(ExecutionError::GeneralError(
+                        "WindowFrameUnits::Groups is not supported.".to_string(),
+                    ));
+                }
+            },
         };
 
         let upper_bound: WindowFrameBound = match spark_window_frame
@@ -1710,15 +1788,43 @@ impl PhysicalPlanner {
             .and_then(|inner| inner.upper_frame_bound_struct.as_ref())
         {
             Some(u) => match u {
-                UpperFrameBoundStruct::UnboundedFollowing(_) => {
-                    WindowFrameBound::Following(ScalarValue::UInt64(None))
-                }
-                UpperFrameBoundStruct::Following(offset) => {
-                    WindowFrameBound::Following(ScalarValue::UInt64(Some(offset.offset as u64)))
-                }
+                UpperFrameBoundStruct::UnboundedFollowing(_) => match units {
+                    WindowFrameUnits::Rows => {
+                        WindowFrameBound::Following(ScalarValue::UInt64(None))
+                    }
+                    WindowFrameUnits::Range => {
+                        WindowFrameBound::Following(ScalarValue::Int64(None))
+                    }
+                    WindowFrameUnits::Groups => {
+                        return Err(ExecutionError::GeneralError(
+                            "WindowFrameUnits::Groups is not supported.".to_string(),
+                        ));
+                    }
+                },
+                UpperFrameBoundStruct::Following(offset) => match units {
+                    WindowFrameUnits::Rows => {
+                        WindowFrameBound::Following(ScalarValue::UInt64(Some(offset.offset as u64)))
+                    }
+                    WindowFrameUnits::Range => {
+                        WindowFrameBound::Following(ScalarValue::Int64(Some(offset.offset)))
+                    }
+                    WindowFrameUnits::Groups => {
+                        return Err(ExecutionError::GeneralError(
+                            "WindowFrameUnits::Groups is not supported.".to_string(),
+                        ));
+                    }
+                },
                 UpperFrameBoundStruct::CurrentRow(_) => WindowFrameBound::CurrentRow,
             },
-            None => WindowFrameBound::Following(ScalarValue::UInt64(None)),
+            None => match units {
+                WindowFrameUnits::Rows => WindowFrameBound::Following(ScalarValue::UInt64(None)),
+                WindowFrameUnits::Range => WindowFrameBound::Following(ScalarValue::Int64(None)),
+                WindowFrameUnits::Groups => {
+                    return Err(ExecutionError::GeneralError(
+                        "WindowFrameUnits::Groups is not supported.".to_string(),
+                    ));
+                }
+            },
         };
 
         let window_frame = WindowFrame::new_bounds(units, lower_bound, upper_bound);
@@ -1855,7 +1961,7 @@ impl PhysicalPlanner {
             .into_iter()
             .zip(input_expr_types.into_iter().zip(coerced_input_types))
             .map(|(expr, (from_type, to_type))| {
-                if !from_type.equals_datatype(&to_type) {
+                if from_type != to_type {
                     Arc::new(CastExpr::new(
                         expr,
                         to_type,
@@ -1885,7 +1991,7 @@ impl PhysicalPlanner {
         schema: SchemaRef,
         children: Vec<Arc<dyn PhysicalExpr>>,
         func: AggregateUDF,
-    ) -> Result<Arc<AggregateFunctionExpr>, ExecutionError> {
+    ) -> Result<AggregateFunctionExpr, ExecutionError> {
         AggregateExprBuilder::new(Arc::new(func), children)
             .schema(schema)
             .alias(name)
@@ -2313,7 +2419,7 @@ mod tests {
         };
 
         let expr = spark_expression::Expr {
-            expr_struct: Some(Eq(Box::new(spark_expression::Equal {
+            expr_struct: Some(Eq(Box::new(spark_expression::BinaryExpr {
                 left: Some(Box::new(left)),
                 right: Some(Box::new(right)),
             }))),

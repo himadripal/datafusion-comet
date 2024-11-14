@@ -19,13 +19,9 @@
 
 package org.apache.comet.vector
 
-import java.nio.ByteOrder
-
 import scala.collection.mutable
 
 import org.apache.arrow.c.{ArrowArray, ArrowImporter, ArrowSchema, CDataDictionaryProvider, Data}
-import org.apache.arrow.c.NativeUtil.NULL
-import org.apache.arrow.memory.util.MemoryUtil
 import org.apache.arrow.vector.VectorSchemaRoot
 import org.apache.arrow.vector.dictionary.DictionaryProvider
 import org.apache.spark.SparkException
@@ -74,15 +70,6 @@ class NativeUtil {
 
     (0 until numCols).foreach { index =>
       val arrowSchema = ArrowSchema.allocateNew(allocator)
-
-      // Manually fill NULL to `release` slot of ArrowSchema because ArrowSchema doesn't provide
-      // `markReleased`.
-      // The total size of ArrowSchema is 72 bytes.
-      // The `release` slot is at offset 56 in the ArrowSchema struct.
-      val buffer =
-        MemoryUtil.directBuffer(arrowSchema.memoryAddress(), 72).order(ByteOrder.nativeOrder)
-      buffer.putLong(56, NULL);
-
       val arrowArray = ArrowArray.allocateNew(allocator)
       arrays(index) = arrowArray
       schemas(index) = arrowSchema
@@ -105,10 +92,14 @@ class NativeUtil {
       arrayAddrs: Array[Long],
       schemaAddrs: Array[Long],
       batch: ColumnarBatch): Int = {
+    val numRows = mutable.ArrayBuffer.empty[Int]
+
     (0 until batch.numCols()).foreach { index =>
       batch.column(index) match {
         case a: CometVector =>
           val valueVector = a.getValueVector
+
+          numRows += valueVector.getValueCount
 
           val provider = if (valueVector.getField.getDictionary != null) {
             a.getDictionaryProvider
@@ -133,7 +124,16 @@ class NativeUtil {
       }
     }
 
-    batch.numRows()
+    if (numRows.distinct.length > 1) {
+      throw new SparkException(
+        s"Number of rows in each column should be the same, but got [${numRows.distinct}]")
+    }
+
+    // `ColumnarBatch.numRows` might return a different number than the actual number of rows in
+    // the Arrow arrays. For example, Iceberg column reader will skip deleted rows internally in
+    // its `CometVector` implementation. The `ColumnarBatch` returned by the reader will report
+    // logical number of rows which is less than actual number of rows due to row deletion.
+    numRows.headOption.getOrElse(batch.numRows())
   }
 
   /**

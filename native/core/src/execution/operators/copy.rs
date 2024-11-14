@@ -50,7 +50,9 @@ pub struct CopyExec {
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum CopyMode {
+    /// Perform a deep copy and also unpack dictionaries
     UnpackOrDeepCopy,
+    /// Perform a clone and also unpack dictionaries
     UnpackOrClone,
 }
 
@@ -260,7 +262,13 @@ fn copy_or_unpack_array(array: &Arc<dyn Array>, mode: &CopyMode) -> Result<Array
     match array.data_type() {
         DataType::Dictionary(_, value_type) => {
             let options = CastOptions::default();
-            cast_with_options(array, value_type.as_ref(), &options)
+            // We need to copy the array after `cast` because arrow-rs `take` kernel which is used
+            // to unpack dictionary array might reuse the input array's null buffer.
+            Ok(copy_array(&cast_with_options(
+                array,
+                value_type.as_ref(),
+                &options,
+            )?))
         }
         _ => {
             if mode == &CopyMode::UnpackOrDeepCopy {

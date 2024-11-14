@@ -29,17 +29,33 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{CometTestBase, DataFrame, Row}
 import org.apache.spark.sql.catalyst.optimizer.SimplifyExtractValueOps
 import org.apache.spark.sql.comet.CometProjectExec
-import org.apache.spark.sql.execution.{ColumnarToRowExec, InputAdapter, WholeStageCodegenExec}
+import org.apache.spark.sql.execution.{ColumnarToRowExec, InputAdapter, ProjectExec, WholeStageCodegenExec}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.SESSION_LOCAL_TIMEZONE
 import org.apache.spark.sql.types.{Decimal, DecimalType}
 
-import org.apache.comet.CometSparkSessionExtensions.{isSpark33Plus, isSpark34Plus}
+import org.apache.comet.CometSparkSessionExtensions.{isSpark33Plus, isSpark34Plus, isSpark40Plus}
 
 class CometExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelper {
   import testImplicits._
+
+  test("compare true/false to negative zero") {
+    Seq(false, true).foreach { dictionary =>
+      withSQLConf("parquet.enable.dictionary" -> dictionary.toString) {
+        val table = "test"
+        withTable(table) {
+          sql(s"create table $table(col1 boolean, col2 float) using parquet")
+          sql(s"insert into $table values(true, -0.0)")
+          sql(s"insert into $table values(false, -0.0)")
+
+          checkSparkAnswerAndOperator(
+            s"SELECT col1, negative(col2), cast(col1 as float), col1 = negative(col2) FROM $table")
+        }
+      }
+    }
+  }
 
   test("coalesce should return correct datatype") {
     Seq(true, false).foreach { dictionaryEnabled =>
@@ -141,6 +157,100 @@ class CometExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelper {
           checkSparkAnswerAndOperator(
             "SELECT _4 FROM tbl WHERE " +
               "_20 > CAST('2020-01-01' AS DATE) AND _18 < CAST('2020-01-01' AS TIMESTAMP)")
+        }
+      }
+    }
+  }
+
+  test("date_add with int scalars") {
+    Seq(true, false).foreach { dictionaryEnabled =>
+      Seq("TINYINT", "SHORT", "INT").foreach { intType =>
+        withTempDir { dir =>
+          val path = new Path(dir.toURI.toString, "test.parquet")
+          makeParquetFileAllTypes(path, dictionaryEnabled = dictionaryEnabled, 10000)
+          withParquetTable(path.toString, "tbl") {
+            checkSparkAnswerAndOperator(f"SELECT _20 + CAST(2 as $intType) from tbl")
+          }
+        }
+      }
+    }
+  }
+
+  test("date_add with scalar overflow") {
+    Seq(true, false).foreach { dictionaryEnabled =>
+      withTempDir { dir =>
+        val path = new Path(dir.toURI.toString, "test.parquet")
+        makeParquetFileAllTypes(path, dictionaryEnabled = dictionaryEnabled, 10000)
+        withParquetTable(path.toString, "tbl") {
+          val (sparkErr, cometErr) =
+            checkSparkMaybeThrows(sql(s"SELECT _20 + ${Int.MaxValue} FROM tbl"))
+          if (isSpark40Plus) {
+            assert(sparkErr.get.getMessage.contains("EXPRESSION_DECODING_FAILED"))
+          } else {
+            assert(sparkErr.get.getMessage.contains("integer overflow"))
+          }
+          assert(cometErr.get.getMessage.contains("`NaiveDate + TimeDelta` overflowed"))
+        }
+      }
+    }
+  }
+
+  test("date_add with int arrays") {
+    Seq(true, false).foreach { dictionaryEnabled =>
+      Seq("_2", "_3", "_4").foreach { intColumn => // tinyint, short, int columns
+        withTempDir { dir =>
+          val path = new Path(dir.toURI.toString, "test.parquet")
+          makeParquetFileAllTypes(path, dictionaryEnabled = dictionaryEnabled, 10000)
+          withParquetTable(path.toString, "tbl") {
+            checkSparkAnswerAndOperator(f"SELECT _20 + $intColumn FROM tbl")
+          }
+        }
+      }
+    }
+  }
+
+  test("date_sub with int scalars") {
+    Seq(true, false).foreach { dictionaryEnabled =>
+      Seq("TINYINT", "SHORT", "INT").foreach { intType =>
+        withTempDir { dir =>
+          val path = new Path(dir.toURI.toString, "test.parquet")
+          makeParquetFileAllTypes(path, dictionaryEnabled = dictionaryEnabled, 10000)
+          withParquetTable(path.toString, "tbl") {
+            checkSparkAnswerAndOperator(f"SELECT _20 - CAST(2 as $intType) from tbl")
+          }
+        }
+      }
+    }
+  }
+
+  test("date_sub with scalar overflow") {
+    Seq(true, false).foreach { dictionaryEnabled =>
+      withTempDir { dir =>
+        val path = new Path(dir.toURI.toString, "test.parquet")
+        makeParquetFileAllTypes(path, dictionaryEnabled = dictionaryEnabled, 10000)
+        withParquetTable(path.toString, "tbl") {
+          val (sparkErr, cometErr) =
+            checkSparkMaybeThrows(sql(s"SELECT _20 - ${Int.MaxValue} FROM tbl"))
+          if (isSpark40Plus) {
+            assert(sparkErr.get.getMessage.contains("EXPRESSION_DECODING_FAILED"))
+          } else {
+            assert(sparkErr.get.getMessage.contains("integer overflow"))
+          }
+          assert(cometErr.get.getMessage.contains("`NaiveDate - TimeDelta` overflowed"))
+        }
+      }
+    }
+  }
+
+  test("date_sub with int arrays") {
+    Seq(true, false).foreach { dictionaryEnabled =>
+      Seq("_2", "_3", "_4").foreach { intColumn => // tinyint, short, int columns
+        withTempDir { dir =>
+          val path = new Path(dir.toURI.toString, "test.parquet")
+          makeParquetFileAllTypes(path, dictionaryEnabled = dictionaryEnabled, 10000)
+          withParquetTable(path.toString, "tbl") {
+            checkSparkAnswerAndOperator(f"SELECT _20 - $intColumn FROM tbl")
+          }
         }
       }
     }
@@ -839,8 +949,11 @@ class CometExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     // Enabling ANSI will cause native engine failure, but as we cannot catch
     // native error now, we cannot test it here.
     withSQLConf(SQLConf.ANSI_ENABLED.key -> "false") {
-      withParquetTable(Seq((1, 0, 1.0, 0.0)), "tbl") {
-        checkSparkAnswerAndOperator("SELECT _1 / _2, _3 / _4 FROM tbl")
+      withParquetTable(Seq((1, 0, 1.0, 0.0, -0.0)), "tbl") {
+        checkSparkAnswerAndOperator("SELECT _1 / _2, _3 / _4, _3 / _5 FROM tbl")
+        checkSparkAnswerAndOperator("SELECT _1 % _2, _3 % _4, _3 % _5 FROM tbl")
+        checkSparkAnswerAndOperator("SELECT _1 / 0, _3 / 0.0, _3 / -0.0 FROM tbl")
+        checkSparkAnswerAndOperator("SELECT _1 % 0, _3 % 0.0, _3 % -0.0 FROM tbl")
       }
     }
   }
@@ -1949,6 +2062,26 @@ class CometExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     }
   }
 
+  test("named_struct with duplicate field names") {
+    Seq(true, false).foreach { dictionaryEnabled =>
+      withTempDir { dir =>
+        val path = new Path(dir.toURI.toString, "test.parquet")
+        makeParquetFileAllTypes(path, dictionaryEnabled = dictionaryEnabled, 10000)
+        withParquetTable(path.toString, "tbl") {
+          checkSparkAnswerAndOperator(
+            "SELECT named_struct('a', _1, 'a', _2) FROM tbl",
+            classOf[ProjectExec])
+          checkSparkAnswerAndOperator(
+            "SELECT named_struct('a', _1, 'a', 2) FROM tbl",
+            classOf[ProjectExec])
+          checkSparkAnswerAndOperator(
+            "SELECT named_struct('a', named_struct('b', _1, 'b', _2)) FROM tbl",
+            classOf[ProjectExec])
+        }
+      }
+    }
+  }
+
   test("to_json") {
     Seq(true, false).foreach { dictionaryEnabled =>
       withParquetTable(
@@ -2079,13 +2212,12 @@ class CometExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelper {
           df.select(array(array(col("_4")), array(col("_4"), lit(null)))))
         checkSparkAnswerAndOperator(df.select(array(col("_8"), col("_13"))))
         // This ends up returning empty strings instead of nulls for the last element
-        // Fixed by https://github.com/apache/datafusion/commit/27304239ef79b50a443320791755bf74eed4a85d
-        // checkSparkAnswerAndOperator(df.select(array(col("_8"), col("_13"), lit(null))))
+        checkSparkAnswerAndOperator(df.select(array(col("_8"), col("_13"), lit(null))))
         checkSparkAnswerAndOperator(df.select(array(array(col("_8")), array(col("_13")))))
         checkSparkAnswerAndOperator(df.select(array(col("_8"), col("_8"), lit(null))))
         checkSparkAnswerAndOperator(df.select(array(struct("_4"), struct("_4"))))
-      // Fixed by https://github.com/apache/datafusion/commit/140f7cec78febd73d3db537a816badaaf567530a
-      // checkSparkAnswerAndOperator(df.select(array(struct(col("_8").alias("a")), struct(col("_13").alias("a")))))
+        checkSparkAnswerAndOperator(
+          df.select(array(struct(col("_8").alias("a")), struct(col("_13").alias("a")))))
       }
     }
   }
@@ -2157,6 +2289,52 @@ class CometExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelper {
           }
         }
       }
+    }
+  }
+
+  test("GetArrayStructFields") {
+    Seq(true, false).foreach { dictionaryEnabled =>
+      withSQLConf(SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> SimplifyExtractValueOps.ruleName) {
+        withTempDir { dir =>
+          val path = new Path(dir.toURI.toString, "test.parquet")
+          makeParquetFileAllTypes(path, dictionaryEnabled = dictionaryEnabled, 10000)
+          val df = spark.read
+            .parquet(path.toString)
+            .select(
+              array(struct(col("_2"), col("_3"), col("_4"), col("_8")), lit(null)).alias("arr"))
+          checkSparkAnswerAndOperator(df.select("arr._2", "arr._3", "arr._4"))
+
+          val complex = spark.read
+            .parquet(path.toString)
+            .select(array(struct(struct(col("_4"), col("_8")).alias("nested"))).alias("arr"))
+
+          checkSparkAnswerAndOperator(complex.select(col("arr.nested._4")))
+        }
+      }
+    }
+  }
+
+  test("array_append") {
+    // array append has been added in Spark 3.4 and in Spark 4.0 it gets written to ArrayInsert
+    assume(isSpark34Plus && !isSpark40Plus)
+    Seq(true, false).foreach { dictionaryEnabled =>
+      withTempDir { dir =>
+        val path = new Path(dir.toURI.toString, "test.parquet")
+        makeParquetFileAllTypes(path, dictionaryEnabled = dictionaryEnabled, 10000)
+        spark.read.parquet(path.toString).createOrReplaceTempView("t1");
+        checkSparkAnswerAndOperator(spark.sql("Select array_append(array(_1),false) from t1"))
+        checkSparkAnswerAndOperator(
+          spark.sql("SELECT array_append(array(_2, _3, _4), 4) FROM t1"))
+        checkSparkAnswerAndOperator(
+          spark.sql("SELECT array_append(array(_2, _3, _4), null) FROM t1"));
+        checkSparkAnswerAndOperator(
+          spark.sql("SELECT array_append(array(_6, _7), CAST(6.5 AS DOUBLE)) FROM t1"));
+        checkSparkAnswerAndOperator(spark.sql("SELECT array_append(array(_8), 'test') FROM t1"));
+        checkSparkAnswerAndOperator(spark.sql("SELECT array_append(array(_19), _19) FROM t1"));
+        checkSparkAnswerAndOperator(
+          spark.sql("SELECT array_append((CASE WHEN _2 =_3 THEN array(_4) END), _4) FROM t1"));
+      }
+
     }
   }
 }

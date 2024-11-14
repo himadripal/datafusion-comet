@@ -48,7 +48,7 @@ pub trait DataPageBuilder {
 ///   - add_def_levels()
 ///   - add_values() for normal data page / add_indices() for dictionary data page
 ///   - consume()
-/// in order to populate and obtain a data page.
+///     in order to populate and obtain a data page.
 pub struct DataPageBuilderImpl {
     desc: ColumnDescPtr,
     encoding: Option<Encoding>,
@@ -122,7 +122,7 @@ impl DataPageBuilder for DataPageBuilderImpl {
         );
         self.encoding = Some(encoding);
         let mut encoder: Box<dyn Encoder<T>> =
-            get_encoder::<T>(encoding).expect("get_encoder() should be OK");
+            get_encoder::<T>(encoding, &self.desc).expect("get_encoder() should be OK");
         encoder.put(values).expect("put() should be OK");
         let encoded_values = encoder
             .flush_buffer()
