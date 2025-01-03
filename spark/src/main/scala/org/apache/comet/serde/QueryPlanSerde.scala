@@ -1745,7 +1745,7 @@ object QueryPlanSerde extends Logging with ShimQueryPlanSerde with CometExprShim
             exprToProtoInternal(elements._1, inputs)
           })
           val thenSeq = branches.map(elements => {
-            allBranches = allBranches :+ elements._1
+            allBranches = allBranches :+ elements._2
             exprToProtoInternal(elements._2, inputs)
           })
           assert(whenSeq.length == thenSeq.length)
@@ -2192,6 +2192,35 @@ object QueryPlanSerde extends Logging with ShimQueryPlanSerde with CometExprShim
             None
           }
 
+        case expr if expr.prettyName == "array_insert" =>
+          val srcExprProto = exprToProto(expr.children(0), inputs, binding)
+          val posExprProto = exprToProto(expr.children(1), inputs, binding)
+          val itemExprProto = exprToProto(expr.children(2), inputs, binding)
+          val legacyNegativeIndex =
+            SQLConf.get.getConfString("spark.sql.legacy.negativeIndexInArrayInsert").toBoolean
+          if (srcExprProto.isDefined && posExprProto.isDefined && itemExprProto.isDefined) {
+            val arrayInsertBuilder = ExprOuterClass.ArrayInsert
+              .newBuilder()
+              .setSrcArrayExpr(srcExprProto.get)
+              .setPosExpr(posExprProto.get)
+              .setItemExpr(itemExprProto.get)
+              .setLegacyNegativeIndex(legacyNegativeIndex)
+
+            Some(
+              ExprOuterClass.Expr
+                .newBuilder()
+                .setArrayInsert(arrayInsertBuilder)
+                .build())
+          } else {
+            withInfo(
+              expr,
+              "unsupported arguments for ArrayInsert",
+              expr.children(0),
+              expr.children(1),
+              expr.children(2))
+            None
+          }
+
         case ElementAt(child, ordinal, defaultValue, failOnError)
             if child.dataType.isInstanceOf[ArrayType] =>
           val childExpr = exprToProto(child, inputs, binding)
@@ -2237,6 +2266,12 @@ object QueryPlanSerde extends Logging with ShimQueryPlanSerde with CometExprShim
             withInfo(expr, "unsupported arguments for GetArrayStructFields", child)
             None
           }
+        case expr if expr.prettyName == "array_contains" =>
+          createBinaryExpr(
+            expr.children(0),
+            expr.children(1),
+            inputs,
+            (builder, binaryExpr) => builder.setArrayContains(binaryExpr))
         case _ if expr.prettyName == "array_append" =>
           createBinaryExpr(
             expr.children(0),
@@ -2479,7 +2514,7 @@ object QueryPlanSerde extends Logging with ShimQueryPlanSerde with CometExprShim
    */
   def operator2Proto(op: SparkPlan, childOp: Operator*): Option[Operator] = {
     val conf = op.conf
-    val result = OperatorOuterClass.Operator.newBuilder()
+    val result = OperatorOuterClass.Operator.newBuilder().setPlanId(op.id)
     childOp.foreach(result.addChildren)
 
     op match {
@@ -2880,7 +2915,12 @@ object QueryPlanSerde extends Logging with ShimQueryPlanSerde with CometExprShim
       case op if isCometSink(op) && op.output.forall(a => supportedDataType(a.dataType, true)) =>
         // These operators are source of Comet native execution chain
         val scanBuilder = OperatorOuterClass.Scan.newBuilder()
-        scanBuilder.setSource(op.simpleStringWithNodeId())
+        val source = op.simpleStringWithNodeId()
+        if (source.isEmpty) {
+          scanBuilder.setSource(op.getClass.getSimpleName)
+        } else {
+          scanBuilder.setSource(source)
+        }
 
         val scanTypes = op.output.flatten { attr =>
           serializeDataType(attr.dataType)

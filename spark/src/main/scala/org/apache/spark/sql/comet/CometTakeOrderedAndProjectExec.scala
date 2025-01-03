@@ -57,7 +57,8 @@ case class CometTakeOrderedAndProjectExec(
     "dataSize" -> SQLMetrics.createSizeMetric(sparkContext, "data size"),
     "numPartitions" -> SQLMetrics.createMetric(
       sparkContext,
-      "number of partitions")) ++ readMetrics ++ writeMetrics
+      "number of partitions")) ++ readMetrics ++ writeMetrics ++ CometMetricNode.shuffleMetrics(
+    sparkContext)
 
   private lazy val serializer: Serializer =
     new UnsafeRowSerializer(child.output.size, longMetric("dataSize"))
@@ -77,12 +78,13 @@ case class CometTakeOrderedAndProjectExec(
         val localTopK = if (orderingSatisfies) {
           CometExecUtils.getNativeLimitRDD(childRDD, child.output, limit)
         } else {
-          childRDD.mapPartitionsInternal { iter =>
+          val numParts = childRDD.getNumPartitions
+          childRDD.mapPartitionsWithIndexInternal { case (idx, iter) =>
             val topK =
               CometExecUtils
                 .getTopKNativePlan(child.output, sortOrder, child, limit)
                 .get
-            CometExec.getCometIterator(Seq(iter), child.output.length, topK)
+            CometExec.getCometIterator(Seq(iter), child.output.length, topK, numParts, idx)
           }
         }
 
@@ -102,7 +104,7 @@ case class CometTakeOrderedAndProjectExec(
         val topKAndProjection = CometExecUtils
           .getProjectionNativePlan(projectList, child.output, sortOrder, child, limit)
           .get
-        val it = CometExec.getCometIterator(Seq(iter), output.length, topKAndProjection)
+        val it = CometExec.getCometIterator(Seq(iter), output.length, topKAndProjection, 1, 0)
         setSubqueries(it.id, this)
 
         Option(TaskContext.get()).foreach { context =>

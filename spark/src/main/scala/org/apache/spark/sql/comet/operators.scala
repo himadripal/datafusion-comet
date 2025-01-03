@@ -19,14 +19,12 @@
 
 package org.apache.spark.sql.comet
 
-import java.io.{ByteArrayOutputStream, DataInputStream}
-import java.nio.channels.Channels
+import java.io.ByteArrayOutputStream
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
-import org.apache.spark.{SparkEnv, TaskContext}
-import org.apache.spark.io.CompressionCodec
+import org.apache.spark.TaskContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression, NamedExpression, SortOrder}
@@ -34,7 +32,7 @@ import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression,
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, PartitioningCollection, UnknownPartitioning}
-import org.apache.spark.sql.comet.execution.shuffle.{ArrowReaderIterator, CometShuffleExchangeExec}
+import org.apache.spark.sql.comet.execution.shuffle.CometShuffleExchangeExec
 import org.apache.spark.sql.comet.plans.PartitioningPreservingUnaryExecNode
 import org.apache.spark.sql.comet.util.Utils
 import org.apache.spark.sql.execution.{BinaryExecNode, ColumnarToRowExec, ExecSubqueryExpression, ExplainUtils, LeafExecNode, ScalarSubquery, SparkPlan, UnaryExecNode}
@@ -78,18 +76,6 @@ abstract class CometExec extends CometPlan {
   // outputPartitioning of SparkPlan, e.g., AQEShuffleReadExec.
   override def outputPartitioning: Partitioning = originalPlan.outputPartitioning
 
-  /**
-   * Executes the Comet operator and returns the result as an iterator of ColumnarBatch.
-   */
-  def executeColumnarCollectIterator(): (Long, Iterator[ColumnarBatch]) = {
-    val countsAndBytes = CometExec.getByteArrayRdd(this).collect()
-    val total = countsAndBytes.map(_._1).sum
-    val rows = countsAndBytes.iterator
-      .flatMap(countAndBytes =>
-        CometExec.decodeBatches(countAndBytes._2, this.getClass.getSimpleName))
-    (total, rows)
-  }
-
   protected def setSubqueries(planId: Long, sparkPlan: SparkPlan): Unit = {
     sparkPlan.children.foreach(setSubqueries(planId, _))
 
@@ -120,20 +106,37 @@ object CometExec {
   def getCometIterator(
       inputs: Seq[Iterator[ColumnarBatch]],
       numOutputCols: Int,
-      nativePlan: Operator): CometExecIterator = {
-    getCometIterator(inputs, numOutputCols, nativePlan, CometMetricNode(Map.empty))
+      nativePlan: Operator,
+      numParts: Int,
+      partitionIdx: Int): CometExecIterator = {
+    getCometIterator(
+      inputs,
+      numOutputCols,
+      nativePlan,
+      CometMetricNode(Map.empty),
+      numParts,
+      partitionIdx)
   }
 
   def getCometIterator(
       inputs: Seq[Iterator[ColumnarBatch]],
       numOutputCols: Int,
       nativePlan: Operator,
-      nativeMetrics: CometMetricNode): CometExecIterator = {
+      nativeMetrics: CometMetricNode,
+      numParts: Int,
+      partitionIdx: Int): CometExecIterator = {
     val outputStream = new ByteArrayOutputStream()
     nativePlan.writeTo(outputStream)
     outputStream.close()
     val bytes = outputStream.toByteArray
-    new CometExecIterator(newIterId, inputs, numOutputCols, bytes, nativeMetrics)
+    new CometExecIterator(
+      newIterId,
+      inputs,
+      numOutputCols,
+      bytes,
+      nativeMetrics,
+      numParts,
+      partitionIdx)
   }
 
   /**
@@ -143,21 +146,6 @@ object CometExec {
     cometPlan.executeColumnar().mapPartitionsInternal { iter =>
       Utils.serializeBatches(iter)
     }
-  }
-
-  /**
-   * Decodes the byte arrays back to ColumnarBatchs and put them into buffer.
-   */
-  def decodeBatches(bytes: ChunkedByteBuffer, source: String): Iterator[ColumnarBatch] = {
-    if (bytes.size == 0) {
-      return Iterator.empty
-    }
-
-    val codec = CompressionCodec.createCodec(SparkEnv.get.conf)
-    val cbbis = bytes.toInputStream()
-    val ins = new DataInputStream(codec.compressedInputStream(cbbis))
-
-    new ArrowReaderIterator(Channels.newChannel(ins), source)
   }
 }
 
@@ -214,13 +202,18 @@ abstract class CometNativeExec extends CometExec {
         // TODO: support native metrics for all operators.
         val nativeMetrics = CometMetricNode.fromCometPlan(this)
 
-        def createCometExecIter(inputs: Seq[Iterator[ColumnarBatch]]): CometExecIterator = {
+        def createCometExecIter(
+            inputs: Seq[Iterator[ColumnarBatch]],
+            numParts: Int,
+            partitionIndex: Int): CometExecIterator = {
           val it = new CometExecIterator(
             CometExec.newIterId,
             inputs,
             output.length,
             serializedPlanCopy,
-            nativeMetrics)
+            nativeMetrics,
+            numParts,
+            partitionIndex)
 
           setSubqueries(it.id, this)
 
@@ -295,7 +288,7 @@ abstract class CometNativeExec extends CometExec {
           throw new CometRuntimeException(s"No input for CometNativeExec:\n $this")
         }
 
-        ZippedPartitionsRDD(sparkContext, inputs.toSeq)(createCometExecIter(_))
+        ZippedPartitionsRDD(sparkContext, inputs.toSeq)(createCometExecIter)
     }
   }
 

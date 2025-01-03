@@ -52,8 +52,9 @@ import org.apache.spark.util.random.XORShiftRandom
 
 import com.google.common.base.Objects
 
+import org.apache.comet.CometConf
 import org.apache.comet.serde.{OperatorOuterClass, PartitioningOuterClass, QueryPlanSerde}
-import org.apache.comet.serde.OperatorOuterClass.Operator
+import org.apache.comet.serde.OperatorOuterClass.{CompressionCodec, Operator}
 import org.apache.comet.serde.QueryPlanSerde.serializeDataType
 import org.apache.comet.shims.ShimCometShuffleExchangeExec
 
@@ -79,7 +80,8 @@ case class CometShuffleExchangeExec(
     "dataSize" -> SQLMetrics.createSizeMetric(sparkContext, "data size"),
     "numPartitions" -> SQLMetrics.createMetric(
       sparkContext,
-      "number of partitions")) ++ readMetrics ++ writeMetrics
+      "number of partitions")) ++ readMetrics ++ writeMetrics ++ CometMetricNode.shuffleMetrics(
+    sparkContext)
 
   override def nodeName: String = if (shuffleType == CometNativeShuffle) {
     "CometExchange"
@@ -224,13 +226,14 @@ object CometShuffleExchangeExec extends ShimCometShuffleExchangeExec {
       outputPartitioning: Partitioning,
       serializer: Serializer,
       metrics: Map[String, SQLMetric]): ShuffleDependency[Int, ColumnarBatch, ColumnarBatch] = {
+    val numParts = rdd.getNumPartitions
     val dependency = new CometShuffleDependency[Int, ColumnarBatch, ColumnarBatch](
       rdd.map(
         (0, _)
       ), // adding fake partitionId that is always 0 because ShuffleDependency requires it
       serializer = serializer,
       shuffleWriterProcessor =
-        new CometShuffleWriteProcessor(outputPartitioning, outputAttributes, metrics),
+        new CometShuffleWriteProcessor(outputPartitioning, outputAttributes, metrics, numParts),
       shuffleType = CometNativeShuffle,
       partitioner = new Partitioner {
         override def numPartitions: Int = outputPartitioning.numPartitions
@@ -446,7 +449,8 @@ object CometShuffleExchangeExec extends ShimCometShuffleExchangeExec {
 class CometShuffleWriteProcessor(
     outputPartitioning: Partitioning,
     outputAttributes: Seq[Attribute],
-    metrics: Map[String, SQLMetric])
+    metrics: Map[String, SQLMetric],
+    numParts: Int)
     extends ShimCometShuffleWriteProcessor {
 
   private val OFFSET_LENGTH = 8
@@ -475,11 +479,21 @@ class CometShuffleWriteProcessor(
     // Call native shuffle write
     val nativePlan = getNativePlan(tempDataFilename, tempIndexFilename)
 
+    val detailedMetrics = Seq(
+      "elapsed_compute",
+      "ipc_time",
+      "repart_time",
+      "mempool_time",
+      "input_batches",
+      "spill_count",
+      "spilled_bytes")
+
     // Maps native metrics to SQL metrics
     val nativeSQLMetrics = Map(
       "output_rows" -> metrics(SQLShuffleWriteMetricsReporter.SHUFFLE_RECORDS_WRITTEN),
       "data_size" -> metrics("dataSize"),
-      "elapsed_compute" -> metrics(SQLShuffleWriteMetricsReporter.SHUFFLE_WRITE_TIME))
+      "write_time" -> metrics(SQLShuffleWriteMetricsReporter.SHUFFLE_WRITE_TIME)) ++
+      metrics.filterKeys(detailedMetrics.contains)
     val nativeMetrics = CometMetricNode(nativeSQLMetrics)
 
     // Getting rid of the fake partitionId
@@ -489,7 +503,9 @@ class CometShuffleWriteProcessor(
       Seq(newInputs.asInstanceOf[Iterator[ColumnarBatch]]),
       outputAttributes.length,
       nativePlan,
-      nativeMetrics)
+      nativeMetrics,
+      numParts,
+      context.partitionId())
 
     while (cometIter.hasNext) {
       cometIter.next()
@@ -524,7 +540,7 @@ class CometShuffleWriteProcessor(
   }
 
   def getNativePlan(dataFile: String, indexFile: String): Operator = {
-    val scanBuilder = OperatorOuterClass.Scan.newBuilder()
+    val scanBuilder = OperatorOuterClass.Scan.newBuilder().setSource("ShuffleWriterInput")
     val opBuilder = OperatorOuterClass.Operator.newBuilder()
 
     val scanTypes = outputAttributes.flatten { attr =>
@@ -537,6 +553,17 @@ class CometShuffleWriteProcessor(
       val shuffleWriterBuilder = OperatorOuterClass.ShuffleWriter.newBuilder()
       shuffleWriterBuilder.setOutputDataFile(dataFile)
       shuffleWriterBuilder.setOutputIndexFile(indexFile)
+
+      if (SparkEnv.get.conf.getBoolean("spark.shuffle.compress", true)) {
+        val codec = CometConf.COMET_EXEC_SHUFFLE_COMPRESSION_CODEC.get() match {
+          case "zstd" => CompressionCodec.Zstd
+          case other => throw new UnsupportedOperationException(s"invalid codec: $other")
+        }
+        shuffleWriterBuilder.setCodec(codec)
+      } else {
+        shuffleWriterBuilder.setCodec(CompressionCodec.None)
+      }
+      shuffleWriterBuilder.setCompressionLevel(CometConf.COMET_EXEC_SHUFFLE_COMPRESSION_LEVEL.get)
 
       outputPartitioning match {
         case _: HashPartitioning =>

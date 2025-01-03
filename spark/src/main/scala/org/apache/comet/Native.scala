@@ -19,8 +19,6 @@
 
 package org.apache.comet
 
-import java.util.Map
-
 import org.apache.spark.CometTaskMemoryManager
 import org.apache.spark.sql.comet.CometMetricNode
 
@@ -45,17 +43,30 @@ class Native extends NativeBase {
    * @return
    *   the address to native query plan.
    */
+  // scalastyle:off
   @native def createPlan(
       id: Long,
-      configMap: Map[String, String],
       iterators: Array[CometBatchIterator],
       plan: Array[Byte],
       metrics: CometMetricNode,
-      taskMemoryManager: CometTaskMemoryManager): Long
+      taskMemoryManager: CometTaskMemoryManager,
+      batchSize: Int,
+      use_unified_memory_manager: Boolean,
+      memory_limit: Long,
+      memory_fraction: Double,
+      debug: Boolean,
+      explain: Boolean,
+      workerThreads: Int,
+      blockingThreads: Int): Long
+  // scalastyle:on
 
   /**
    * Execute a native query plan based on given input Arrow arrays.
    *
+   * @param stage
+   *   the stage ID, for informational purposes
+   * @param partition
+   *   the partition ID, for informational purposes
    * @param plan
    *   the address to native query plan.
    * @param arrayAddrs
@@ -65,7 +76,12 @@ class Native extends NativeBase {
    * @return
    *   the number of rows, if -1, it means end of the output.
    */
-  @native def executePlan(plan: Long, arrayAddrs: Array[Long], schemaAddrs: Array[Long]): Long
+  @native def executePlan(
+      stage: Int,
+      partition: Int,
+      plan: Long,
+      arrayAddrs: Array[Long],
+      schemaAddrs: Array[Long]): Long
 
   /**
    * Release and drop the native query plan object and context object.
